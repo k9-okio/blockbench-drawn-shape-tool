@@ -29,6 +29,7 @@ A Blockbench plugin that turns freehand strokes on a grid into real geometry. Dr
 - **Local bending**: set bend amount and transition width, then paint the columns to bend (hold Alt to erase). The transition eases in and out instead of creasing, with an optional "return to straight" profile or a one-way slope.
 - **Local width**: widen or narrow painted columns smoothly, with an adjustable transition width; mirrored automatically when symmetry is on.
 - **Per-region cube/triangle mixing**: mark cells as cubes or triangles, e.g. a cube blade body with a triangle edge. Adjacent triangle cells merge into one continuous surface.
+- **Viewport points**: press `在视口取点` (place points in viewport) and click directly in the 3D viewport. Points snap to the grid and stick to existing cube surfaces: 2 points make a thin line, 3 points a triangle face, 4 points the box enclosing them, with generate / undo / clear buttons in the floating bar.
 - **Other parameters**: grid cell size, Z thickness, drawing plane, whole-group XYZ offset, and roundness (off / light / medium / high).
 - Results are placed in a new `drawn_*_shape_*` group whose pivot sits at the bounding-box center, so the new geometry can be moved, rotated, textured and animated, and the operation can be undone.
 
@@ -45,4 +46,4 @@ For smooth triangle shapes, create a `Generic Model / Free Model` project and ex
 
 ## Version
 
-Current version **v1.12.1** by k9-okio. Tags: Modeling / Tools / Geometry.
+Current version **v1.13.0** by k9-okio. Tags: Modeling / Tools / Geometry.
