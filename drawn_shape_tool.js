@@ -8,12 +8,13 @@ BBPlugin.register('drawn_shape_tool', {
 	id: 'drawn_shape_tool',
 	title: '手绘形状生成器',
 	author: 'k9-okio',
-	description: '手动画线并闭合轮廓，支持对称、局部弯曲与宽度，以及按位置混合方块和三角面。',
+	description: '手动画线并闭合轮廓，支持对称、局部弯曲与宽度，以及按位置混合方块和三角面；也可在 3D 视口取点，用 2/3/4 个点生成线、面和方块。',
 	website: 'https://github.com/k9-okio/blockbench-drawn-shape-tool',
 	repository: 'https://github.com/k9-okio/blockbench-drawn-shape-tool',
 	about: [
 		'在网格上按住鼠标或手指连续画线。松开鼠标只会结束当前一笔，不会自动闭合或填充。',
 		'继续画到起点即可闭合，也可以点击“闭合轮廓”手动连接当前终点与起点。',
+		'视口取点：点击“在视口取点”后，把对话框挪到一边，在 3D 视口里直接点击放置顶点（吸附到网格，点已有方块时贴合表面）。2 个点生成细线，3 个点生成三角面，4 个点生成包围它们的方块。',
 		'方块模式适用于所有支持立方体的 Blockbench 格式，并会合并连续区域以减少组件数量。',
 		'三角形模式需要当前格式支持网格元素。Generic Model / Free Model 支持；Java Block/Item 不导出任意网格，因此只能使用方块模式。',
 		'“纯三角形（3 点）”会依次使用三次点击的坐标生成一个无圆润处理的三角形；Z 尺寸为 0 时是单面，大于 0 时生成可调厚度的三角柱。',
@@ -24,7 +25,7 @@ BBPlugin.register('drawn_shape_tool', {
 	icon: 'gesture',
 	variant: 'desktop',
 	min_version: '5.0.0',
-	version: '1.12.1',
+	version: '1.13.0',
 	tags: ['Modeling', 'Tools', 'Geometry'],
 
 	onload() {
@@ -86,6 +87,9 @@ BBPlugin.register('drawn_shape_tool', {
 			trimmed: false,
 			origin: [0, 0, 0],
 			origin_touched: false,
+			point_mode: false,
+			point_width: 0.5,
+			point_points: [],
 			points: [],
 			drawing: false,
 			closed: false,
@@ -1074,6 +1078,432 @@ BBPlugin.register('drawn_shape_tool', {
 			return {cubes, mesh, parts};
 		}
 
+		// ---- 视口取点：2 点连线 / 3 点成面 / 4 点成方块 ----
+		let point_overlay = null;
+		let point_overlay_frame = 0;
+		let point_pointer_listener = null;
+		let point_bar = null;
+
+		function activePreview() {
+			try {
+				return Blockbench.Preview && Blockbench.Preview.selected
+					? Blockbench.Preview.selected
+					: null;
+			} catch (error) {
+				return null;
+			}
+		}
+
+		function snapModelPoint(vector) {
+			const cell = state.cell_size || 1;
+			return vector.map(value => round4(Math.round(value / cell) * cell));
+		}
+
+		function previewPlanePoint(preview, event) {
+			if (!preview || !preview.canvas || !preview.camera) return null;
+			const plane = PLANES[state.plane] || PLANES.xy;
+			const normal = new THREE.Vector3(plane.n[0], plane.n[1], plane.n[2]);
+			const point_on_plane = new THREE.Vector3(
+				state.origin[0] + plane.n[0] * state.depth,
+				state.origin[1] + plane.n[1] * state.depth,
+				state.origin[2] + plane.n[2] * state.depth
+			);
+			const math_plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, point_on_plane);
+			const rect = preview.canvas.getBoundingClientRect();
+			if (!rect.width || !rect.height) return null;
+			const ndc = new THREE.Vector2(
+				((event.clientX - rect.left) / rect.width) * 2 - 1,
+				-((event.clientY - rect.top) / rect.height) * 2 + 1
+			);
+			const raycaster = new THREE.Raycaster();
+			raycaster.setFromCamera(ndc, preview.camera);
+			const hit = new THREE.Vector3();
+			return raycaster.ray.intersectPlane(math_plane, hit) ? hit : null;
+		}
+
+		function pickViewportPoint(event) {
+			const preview = activePreview();
+			if (!preview || !preview.canvas) return null;
+			let hit = null;
+			try {
+				const data = preview.raycast(event);
+				if (data && data.intersects && data.intersects.length) {
+					hit = data.intersects[0].point.clone();
+				}
+			} catch (error) {
+				console.warn('Drawn Shape Tool: viewport raycast failed', error);
+			}
+			if (!hit) hit = previewPlanePoint(preview, event);
+			return hit ? snapModelPoint(hit.toArray()) : null;
+		}
+
+		function ensureOverlayCanvas() {
+			if (!point_overlay) {
+				point_overlay = document.createElement('canvas');
+				point_overlay.id = 'dst_point_overlay';
+				point_overlay.style.position = 'fixed';
+				point_overlay.style.pointerEvents = 'none';
+				point_overlay.style.zIndex = '70';
+				document.body.append(point_overlay);
+			}
+			return point_overlay;
+		}
+
+		function drawPointOverlay() {
+			point_overlay_frame = 0;
+			if (!state.point_mode) {
+				if (point_overlay) point_overlay.style.display = 'none';
+				return;
+			}
+			point_overlay_frame = requestAnimationFrame(drawPointOverlay);
+			const preview = activePreview();
+			const overlay = ensureOverlayCanvas();
+			if (!preview || !preview.canvas || !preview.canvas.isConnected || !preview.camera) {
+				overlay.style.display = 'none';
+				return;
+			}
+			const rect = preview.canvas.getBoundingClientRect();
+			const width = Math.max(1, Math.round(rect.width));
+			const height = Math.max(1, Math.round(rect.height));
+			const dpr = window.devicePixelRatio || 1;
+			if (overlay.width !== Math.round(width * dpr) || overlay.height !== Math.round(height * dpr)) {
+				overlay.width = Math.round(width * dpr);
+				overlay.height = Math.round(height * dpr);
+			}
+			overlay.style.display = 'block';
+			overlay.style.left = `${rect.left}px`;
+			overlay.style.top = `${rect.top}px`;
+			overlay.style.width = `${width}px`;
+			overlay.style.height = `${height}px`;
+			const ctx = overlay.getContext('2d');
+			if (!ctx) return;
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			ctx.clearRect(0, 0, width, height);
+			const projected = state.point_points.map(point => {
+				const vector = new THREE.Vector3(point[0], point[1], point[2]).project(preview.camera);
+				return {
+					x: (vector.x * 0.5 + 0.5) * width,
+					y: (-vector.y * 0.5 + 0.5) * height,
+					visible: vector.z <= 1
+				};
+			});
+			ctx.lineWidth = 2;
+			ctx.strokeStyle = 'rgba(255, 210, 74, 0.95)';
+			ctx.beginPath();
+			projected.forEach((point, index) => {
+				if (index === 0) ctx.moveTo(point.x, point.y);
+				else ctx.lineTo(point.x, point.y);
+			});
+			ctx.stroke();
+			projected.forEach((point, index) => {
+				if (!point.visible) return;
+				ctx.beginPath();
+				ctx.arc(point.x, point.y, 6, 0, Math.PI * 2);
+				ctx.fillStyle = '#ffd24a';
+				ctx.fill();
+				ctx.lineWidth = 2;
+				ctx.strokeStyle = '#4a3200';
+				ctx.stroke();
+				ctx.fillStyle = '#2b1c00';
+				ctx.font = 'bold 11px sans-serif';
+				ctx.fillText(String(index + 1), point.x + 9, point.y - 8);
+			});
+		}
+
+		function onViewportPointerDown(event) {
+			if (!state.point_mode || event.button !== 0) return;
+			const preview = activePreview();
+			if (!preview || !preview.canvas || event.target !== preview.canvas) return;
+			const point = pickViewportPoint(event);
+			if (!point) return;
+			event.preventDefault();
+			event.stopPropagation();
+			if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+			state.point_points.push(point);
+			updatePointPanel();
+			if (state.point_points.length >= 4) {
+				createPointShape(true);
+			}
+		}
+
+		function ensurePointBar() {
+			if (point_bar) return point_bar;
+			point_bar = createElement('div', 'dst_point_bar');
+			point_bar.dataset.open = 'false';
+			const title = createElement('div', 'dst_point_bar_title', '取点模式：2 点线 / 3 点面 / 4 点方块');
+			const make = createElement('button', '', '生成');
+			make.type = 'button';
+			const undo = createElement('button', '', '撤销');
+			undo.type = 'button';
+			const clear = createElement('button', '', '清空');
+			clear.type = 'button';
+			const back = createElement('button', '', '返回面板');
+			back.type = 'button';
+			const info = createElement('div', 'dst_point_bar_info', '');
+			info.id = 'dst_point_bar_info';
+			make.addEventListener('click', () => createPointShape(false));
+			undo.addEventListener('click', () => {
+				if (state.point_points.length) state.point_points.pop();
+				updatePointPanel();
+			});
+			clear.addEventListener('click', () => {
+				state.point_points = [];
+				updatePointPanel();
+			});
+			back.addEventListener('click', () => {
+				stopPointMode(false);
+				if (dialog) dialog.show();
+			});
+			point_bar.append(title, make, undo, clear, back, info);
+			document.body.append(point_bar);
+			return point_bar;
+		}
+
+		function startPointMode() {
+			if (!Project || !Format) {
+				Blockbench.showMessageBox({
+					title: '视口取点',
+					message: '请先打开或新建一个模型项目。',
+					icon: 'info'
+				});
+				return;
+			}
+			if (state.point_mode) return;
+			syncStateFromInputs();
+			state.point_mode = true;
+			state.point_points = [];
+			ensureOverlayCanvas();
+			ensurePointBar();
+			if (dialog) dialog.hide();
+			point_bar.dataset.open = 'true';
+			if (!point_pointer_listener) {
+				point_pointer_listener = event => onViewportPointerDown(event);
+			}
+			document.addEventListener('pointerdown', point_pointer_listener, true);
+			updatePointPanel();
+			if (!point_overlay_frame) drawPointOverlay();
+		}
+
+		function stopPointMode(keep_points) {
+			state.point_mode = false;
+			if (point_pointer_listener) {
+				document.removeEventListener('pointerdown', point_pointer_listener, true);
+			}
+			if (point_overlay_frame) {
+				cancelAnimationFrame(point_overlay_frame);
+				point_overlay_frame = 0;
+			}
+			if (point_overlay) point_overlay.style.display = 'none';
+			if (point_bar) point_bar.dataset.open = 'false';
+			if (!keep_points) state.point_points = [];
+			updatePointPanel();
+		}
+
+		function updatePointPanel() {
+			const bar_info = point_bar ? point_bar.querySelector('#dst_point_bar_info') : null;
+			const points = state.point_points.map(
+				(point, index) => `P${index + 1}(${point.join(', ')})`
+			);
+			const summary = points.length
+				? `${points.join('  ')}　${state.point_points.length === 2
+					? '再放 1 或 2 个点，或点“生成”'
+					: '再放 1 个点自动生成方块，或点“生成”'}`
+				: state.point_mode
+					? '在 3D 视口点击放置第 1 个点（自动吸附网格；点已有方块会贴到表面）'
+					: '点击“在视口取点”后，本面板会暂时收起，直接在 3D 视口里点击放点';
+			if (bar_info) bar_info.textContent = summary;
+			if (!dialog || !dialog.object) return;
+			const button = dialog.object.querySelector('#dst_point_toggle');
+			if (button) {
+				button.textContent = state.point_mode ? '正在视口取点…' : '在视口取点';
+				button.dataset.active = state.point_mode ? 'true' : 'false';
+			}
+			const info = dialog.object.querySelector('#dst_point_info');
+			if (info) info.textContent = summary;
+		}
+
+		function createLineCube(group, a, b) {
+			const width = Math.max(0.0625, state.point_width || 0.5);
+			const from = [];
+			const to = [];
+			for (let axis = 0; axis < 3; axis++) {
+				let low = Math.min(a[axis], b[axis]);
+				let high = Math.max(a[axis], b[axis]);
+				if (high - low < width) {
+					const center = (low + high) / 2;
+					low = center - width / 2;
+					high = center + width / 2;
+				}
+				from.push(round4(low));
+				to.push(round4(high));
+			}
+			const cube = new Cube({
+				name: 'point_line',
+				from,
+				to,
+				autouv: 1
+			});
+			cube.init();
+			cube.addTo(group);
+			if (!cube.box_uv) cube.mapAutoUV();
+			applyDefaultTexture(cube);
+			return cube;
+		}
+
+		function createFaceMesh(group, points) {
+			const mesh = new Mesh({
+				name: 'point_face',
+				vertices: {},
+				faces: {},
+				seams: {},
+				color: 0
+			});
+			const keys = mesh.addVertices(...points.map(point => point.slice()));
+			const minimum = [0, 1, 2].map(axis => Math.min(...points.map(point => point[axis])));
+			const maximum = [0, 1, 2].map(axis => Math.max(...points.map(point => point[axis])));
+			const uv_width = Project.texture_width || 16;
+			const uv_height = Project.texture_height || 16;
+			const uv = {};
+			keys.forEach((key, index) => {
+				const point = points[index];
+				uv[key] = [
+					round4((point[0] - minimum[0]) / (maximum[0] - minimum[0] || 1) * uv_width),
+					round4((1 - (point[1] - minimum[1]) / (maximum[1] - minimum[1] || 1)) * uv_height)
+				];
+			});
+			mesh.addFaces(new MeshFace(mesh, {vertices: keys, uv}));
+			mesh.addFaces(new MeshFace(mesh, {vertices: keys.slice().reverse(), uv}));
+			mesh.init();
+			mesh.addTo(group);
+			mesh.shading = 'flat';
+			applyDefaultTexture(mesh);
+			return mesh;
+		}
+
+		function createBoxCube(group, points) {
+			const minimum_size = Math.max(0.0625, state.point_width || 0.5);
+			const from = [];
+			const to = [];
+			for (let axis = 0; axis < 3; axis++) {
+				let low = Math.min(...points.map(point => point[axis]));
+				let high = Math.max(...points.map(point => point[axis]));
+				if (high - low < minimum_size) {
+					const center = (low + high) / 2;
+					low = center - minimum_size / 2;
+					high = center + minimum_size / 2;
+				}
+				from.push(round4(low));
+				to.push(round4(high));
+			}
+			const cube = new Cube({
+				name: 'point_box',
+				from,
+				to,
+				autouv: 1
+			});
+			cube.init();
+			cube.addTo(group);
+			if (!cube.box_uv) cube.mapAutoUV();
+			applyDefaultTexture(cube);
+			return cube;
+		}
+
+		function createPointShape(automatic) {
+			if (!Project || !Format) {
+				Blockbench.showMessageBox({
+					title: '视口取点',
+					message: '请先打开或新建一个模型项目。',
+					icon: 'info'
+				});
+				return false;
+			}
+			syncStateFromInputs();
+			const points = state.point_points.slice();
+			if (points.length < 2) {
+				Blockbench.showMessageBox({
+					title: '点不够',
+					message: '至少需要在 3D 视口里放置 2 个点：2 点连线、3 点成面、4 点成方块。',
+					icon: 'info'
+				});
+				return false;
+			}
+			if (points.length === 3 && !Format.meshes) {
+				Blockbench.showMessageBox({
+					title: '当前格式不支持三角形网格',
+					message: 'Java Block/Item 不能导出任意三角面。请再放一个点生成方块，或改用 Generic Model / Free Model。',
+					icon: 'info'
+				});
+				return false;
+			}
+
+			const created_elements = [];
+			const created_groups = [];
+			Undo.initEdit({elements: [], groups: [], outliner: true, selection: true});
+			try {
+				const group = createGroup(makeShapeName('point_shape'));
+				created_groups.push(group);
+				if (points.length === 2) {
+					created_elements.push(createLineCube(group, points[0], points[1]));
+				} else if (points.length === 3) {
+					created_elements.push(createFaceMesh(group, points));
+				} else {
+					created_elements.push(createBoxCube(group, points));
+				}
+				const group_origin = rebaseGeneratedGroup(group, created_elements);
+				try {
+					unselectAllElements();
+					group.select();
+					if (Texture.all.length) UVEditor.loadData();
+				} catch (selection_error) {
+					console.warn('Drawn Shape Tool: selection refresh failed', selection_error);
+				}
+				Undo.finishEdit('生成取点形状', {
+					elements: created_elements,
+					groups: created_groups,
+					outliner: true,
+					selection: true
+				});
+				try {
+					Canvas.updateAll();
+				} catch (canvas_error) {
+					Canvas.updateView({
+						elements: created_elements,
+						element_aspects: {geometry: true, transform: true, uv: true}
+					});
+				}
+				Blockbench.dispatchEvent('add_drawn_shape', {
+					elements: created_elements,
+					group: group,
+					mode: 'point',
+					plane: state.plane,
+					position: group_origin
+				});
+				Blockbench.showQuickMessage(
+					points.length === 2
+						? '已按 2 个点生成线段'
+						: points.length === 3
+							? '已按 3 个点生成三角面'
+							: '已按 4 个点生成方块'
+				);
+				state.point_points = [];
+				updatePointPanel();
+				return true;
+			} catch (error) {
+				console.error('Drawn Shape Tool:', error);
+				try {
+					Undo.cancelEdit();
+				} catch (cancel_error) {
+					console.warn('Drawn Shape Tool: Undo cancel failed', cancel_error);
+				}
+				Blockbench.showMessageBox({
+					title: '生成失败',
+					message: error && error.message ? error.message : String(error),
+					icon: 'error'
+				});
+				return false;
+			}
+		}
+
 		function makeShapeName(prefix) {
 			const now = new Date();
 			const pad = value => String(value).padStart(2, '0');
@@ -1632,6 +2062,9 @@ BBPlugin.register('drawn_shape_tool', {
 			state.symmetry = dialog.object.querySelector('#dst_symmetry').checked;
 			state.merge = dialog.object.querySelector('#dst_merge').checked;
 			state.snap = dialog.object.querySelector('#dst_snap').checked;
+			if (dialog.object.querySelector('#dst_point_width')) {
+				state.point_width = readNumber('dst_point_width', 0.5, 0.0625, 8);
+			}
 			state.origin = [
 				readNumber('dst_origin_x', state.origin[0], -4096, 4096),
 				readNumber('dst_origin_y', state.origin[1], -4096, 4096),
@@ -1928,7 +2361,52 @@ BBPlugin.register('drawn_shape_tool', {
 			format_note.id = 'dst_format_note';
 			hint.append(hint_node, format_note);
 
-			draw_panel.append(toolbar, canvas_shell, canvas_footer, hint);
+			const point_panel = createElement('section', 'dst_point_panel');
+			const point_title = createElement('h4', '', '视口取点：2 点连线 / 3 点成面 / 4 点成方块');
+			const point_row = createElement('div', 'dst_canvas_footer');
+			const point_toggle = createElement('button', 'dst_secondary_button', '在视口取点');
+			point_toggle.id = 'dst_point_toggle';
+			point_toggle.type = 'button';
+			const point_make = createElement('button', 'dst_secondary_button', '生成当前形状');
+			point_make.type = 'button';
+			const point_undo = createElement('button', 'dst_secondary_button', '撤销上一点');
+			point_undo.type = 'button';
+			const point_clear = createElement('button', 'dst_secondary_button', '清空点');
+			point_clear.type = 'button';
+			const point_width_field = createElement('label', 'dst_field');
+			const point_width_title = createElement('span', '', '线宽 / 最小厚度');
+			const point_width_input = document.createElement('input');
+			point_width_input.id = 'dst_point_width';
+			point_width_input.type = 'number';
+			point_width_input.min = '0.0625';
+			point_width_input.max = '8';
+			point_width_input.step = '0.0625';
+			point_width_input.value = '0.5';
+			point_width_field.append(point_width_title, point_width_input);
+			point_row.append(point_toggle, point_make, point_undo, point_clear, point_width_field);
+			const point_info = createElement(
+				'div',
+				'dst_hint_main',
+				'点击“在视口取点”，然后把本对话框拖到一边，在 3D 视口里点击放点'
+			);
+			point_info.id = 'dst_point_info';
+			point_panel.append(point_title, point_row, point_info);
+
+			draw_panel.append(toolbar, canvas_shell, canvas_footer, hint, point_panel);
+
+			point_toggle.addEventListener('click', () => {
+				if (state.point_mode) stopPointMode(false);
+				else startPointMode();
+			});
+			point_make.addEventListener('click', () => createPointShape(false));
+			point_undo.addEventListener('click', () => {
+				if (state.point_points.length) state.point_points.pop();
+				updatePointPanel();
+			});
+			point_clear.addEventListener('click', () => {
+				state.point_points = [];
+				updatePointPanel();
+			});
 
 			const settings_panel = createElement('aside', 'dst_settings_panel');
 			const settings_title = createElement('h3', '', '生成设置');
@@ -2113,6 +2591,7 @@ BBPlugin.register('drawn_shape_tool', {
 
 			wrapper.append(draw_panel, settings_panel);
 			host.append(wrapper);
+			updatePointPanel();
 
 			canvas.addEventListener('pointerdown', event => {
 				if (event.button !== 0) return;
@@ -2530,6 +3009,72 @@ BBPlugin.register('drawn_shape_tool', {
 			.dst_stats[data-ready="true"] {
 				color: #75d6ff;
 			}
+			.dst_point_panel {
+				display: flex;
+				flex-direction: column;
+				gap: 6px;
+				padding: 8px 10px;
+				border: 1px solid rgba(87, 112, 134, 0.35);
+				border-radius: 6px;
+				background: rgba(87, 112, 134, 0.08);
+			}
+			.dst_point_panel h4 {
+				margin: 0;
+				font-size: 12px;
+				color: var(--color-light);
+			}
+			.dst_point_panel .dst_canvas_footer {
+				padding: 0;
+				border: none;
+			}
+			#dst_point_toggle[data-active="true"] {
+				background: rgba(255, 210, 74, 0.24);
+				border-color: rgba(255, 210, 74, 0.65);
+				color: #ffd24a;
+			}
+			.dst_point_bar {
+				position: fixed;
+				left: 50%;
+				top: 12px;
+				transform: translateX(-50%);
+				display: none;
+				align-items: center;
+				gap: 8px;
+				padding: 8px 12px;
+				border-radius: 8px;
+				background: rgba(18, 24, 30, 0.94);
+				border: 1px solid rgba(255, 210, 74, 0.55);
+				box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+				z-index: 90;
+				color: #e6e6e6;
+				font-size: 12px;
+			}
+			.dst_point_bar[data-open="true"] {
+				display: flex;
+			}
+			.dst_point_bar button {
+				padding: 4px 10px;
+				border-radius: 4px;
+				border: 1px solid rgba(255, 255, 255, 0.25);
+				background: rgba(255, 255, 255, 0.08);
+				color: inherit;
+				cursor: pointer;
+			}
+			.dst_point_bar button:hover {
+				background: rgba(255, 210, 74, 0.25);
+			}
+			.dst_point_bar_title {
+				font-weight: 700;
+				color: #ffd24a;
+				white-space: nowrap;
+			}
+			.dst_point_bar_info {
+				max-width: 520px;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				color: #b9c3cc;
+			}
 			@media (max-width: 760px) {
 				.dst_wrapper {
 					grid-template-columns: 1fr;
@@ -2564,6 +3109,7 @@ BBPlugin.register('drawn_shape_tool', {
 				if (hint_node && state.mode === 'triangle_face') {
 					hint_node.textContent = '依次点击三个角点，插件会直接生成一个无厚度的纯三角面。';
 				}
+				updatePointPanel();
 				updatePreview();
 			},
 			onConfirm() {
@@ -2572,6 +3118,10 @@ BBPlugin.register('drawn_shape_tool', {
 			onCancel() {
 				state.drawing = false;
 				active_pointer = null;
+				stopPointMode(false);
+			},
+			onClose() {
+				stopPointMode(false);
 			}
 		});
 
@@ -2589,11 +3139,31 @@ BBPlugin.register('drawn_shape_tool', {
 		drawn_shape_tool_resources.dialog = dialog;
 		drawn_shape_tool_resources.action = open_action;
 		drawn_shape_tool_resources.style = style_node;
+		drawn_shape_tool_resources.cleanup = () => {
+			try {
+				stopPointMode(false);
+			} catch (error) {
+				console.warn('Drawn Shape Tool: point mode cleanup failed', error);
+			}
+			if (point_overlay) {
+				point_overlay.remove();
+				point_overlay = null;
+			}
+			if (point_bar) {
+				point_bar.remove();
+				point_bar = null;
+			}
+		};
 
 		console.log('Drawn Shape Tool loaded');
 	},
 
 	onunload() {
+		try {
+			if (drawn_shape_tool_resources.cleanup) drawn_shape_tool_resources.cleanup();
+		} catch (error) {
+			console.warn('Drawn Shape Tool unload cleanup:', error);
+		}
 		try {
 			MenuBar.removeAction('tools.drawn_shape_tool_open');
 		} catch (error) {
