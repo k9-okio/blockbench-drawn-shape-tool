@@ -83,6 +83,16 @@ You can also set the default region to triangle and mark specific positions as c
 
 Adjacent triangle regions are merged into one continuous area before the mesh is generated. Two triangle cells share an edge or surface instead of each closing separately and only touching at one vertex, which makes them much better for connected blade edges.
 
+## Viewport points (2 points = line, 3 = face, 4 = box)
+
+1. In the `视口取点` (viewport points) section at the bottom of the dialog, press `在视口取点`. The dialog hides and a floating point bar appears at the top of the screen.
+2. Click directly in the Blockbench 3D viewport to place vertices. Coordinates snap to the grid; clicking an existing cube sticks to its surface, while clicking empty space places the point on the current drawing plane.
+3. 2 points produce a thin cuboid line (width from `线宽 / 最小厚度`), 3 points produce a triangle face (needs a format with mesh support such as Generic Model / Free Model), and 4 points produce the box enclosing them (a zero-thickness axis is expanded to the minimum thickness).
+4. With fewer than 4 points, press `生成` in the floating bar; `撤销` removes the last point and `清空` removes all. The 4th point generates the box automatically and clears the list so you can continue with the next shape.
+5. Press `返回面板` to leave point mode and return to the dialog.
+
+Note: in point mode the left mouse button is reserved for placing points; use the right or middle mouse button, or return to the panel, when you need to orbit or pan the view.
+
 ## Format limitations
 
 The Java Block/Item export format only contains cuboids and no arbitrary triangle meshes. The plugin disables triangle and hybrid modes in Java Block/Item so shapes never look correct in Blockbench but vanish after export.
